@@ -15,13 +15,12 @@ import bitsandbytes as bnb
 """
 from peft import (  # noqa: E402
     LoraConfig,
-    BottleneckConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     set_peft_model_state_dict,
 )
-from transformers import AutoModelForCausalLM, AutoTokenizer, LLaMATokenizer  # noqa: F402
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizerFast  # noqa: F402
 
 
 def train(
@@ -56,13 +55,11 @@ def train(
         # llm hyperparams
         train_on_inputs: bool = True,  # if False, masks out inputs in loss
         group_by_length: bool = False,  # faster, but produces an odd training loss curve
-        # wandb params
-        wandb_project: str = "",
-        wandb_run_name: str = "",
-        wandb_watch: str = "",  # options: false | gradients | all
-        wandb_log_model: str = "",  # options: false | true
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
 ):
+    # Disable wandb
+    os.environ["WANDB_DISABLED"] = "true"
+    
     print(
         f"Finetuning model with params:\n"
         f"base_model: {base_model}\n"
@@ -89,15 +86,11 @@ def train(
         f"adapter_name: {adapter_name}\n"
         f"target_modules: {target_modules}\n"
         f"group_by_length: {group_by_length}\n"
-        f"wandb_project: {wandb_project}\n"
-        f"wandb_run_name: {wandb_run_name}\n"
-        f"wandb_watch: {wandb_watch}\n"
-        f"wandb_log_model: {wandb_log_model}\n"
         f"resume_from_checkpoint: {resume_from_checkpoint}\n"
     )
     assert (
         base_model
-    ), "Please specify a --base_model, e.g. --base_model='decapoda-research/LLaMA-7b-hf'"
+    ), "Please specify a --base_model, e.g. --base_model='elinas/llama-7b-hf-transformers-4.29'"
     gradient_accumulation_steps = batch_size // micro_batch_size
 
     device_map = "auto"
@@ -107,28 +100,15 @@ def train(
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
-    # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
-            "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
-    )
-    # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = wandb_project
-    if len(wandb_watch) > 0:
-        os.environ["WANDB_WATCH"] = wandb_watch
-    if len(wandb_log_model) > 0:
-        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
-
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=True,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
 
     if model.config.model_type == "LLaMA":
         # Due to the name of transformers' LLaMATokenizer, we have to do this
-        tokenizer = LLaMATokenizer.from_pretrained(base_model)
+        tokenizer = LlamaTokenizerFast.from_pretrained(base_model)
     else:
         tokenizer = AutoTokenizer.from_pretrained(base_model)
 
@@ -174,7 +154,7 @@ def train(
                                                                     ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    model = prepare_model_for_int8_training(model, use_gradient_checkpointing=use_gradient_checkpointing)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=use_gradient_checkpointing)
     if adapter_name == "lora":
         config = LoraConfig(
             r=lora_r,
@@ -184,19 +164,8 @@ def train(
             bias="none",
             task_type="CAUSAL_LM",
         )
-    elif adapter_name == "bottleneck":
-        config = BottleneckConfig(
-            bottleneck_size=bottleneck_size,
-            non_linearity=non_linearity,
-            adapter_dropout=adapter_dropout,
-            use_parallel_adapter=use_parallel_adapter,
-            use_adapterp=use_adapterp,
-            target_modules=target_modules,
-            scaling=scaling,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-    model = get_peft_model(model, config)
+
+    model = get_peft_model(model, config).to("cpu")
 
     if data_path.endswith(".json"):  # todo: support jsonl
         data = load_dataset("json", data_files=data_path)
@@ -254,7 +223,6 @@ def train(
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
-            fp16=True,
             logging_steps=10,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
@@ -264,10 +232,8 @@ def train(
             output_dir=output_dir,
             save_total_limit=3,
             load_best_model_at_end=True if val_set_size > 0 else False,
-            ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
-            run_name=wandb_run_name if use_wandb else None,
+            report_to=None
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
