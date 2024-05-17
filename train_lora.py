@@ -30,13 +30,13 @@ def train(
         output_dir: str = "./lora-alpaca",
         adapter_name: str = "lora",
         # training hyperparams
-        batch_size: int = 128,
+        batch_size: int = 32,
         micro_batch_size: int = 4,
         num_epochs: int = 3,
         learning_rate: float = 3e-4,
         cutoff_len: int = 256,
         val_set_size: int = 2000,
-        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing: bool = True,
         eval_step: int = 200,
         save_step: int = 200,
         # lora hyperparams
@@ -59,7 +59,7 @@ def train(
 ):
     # Disable wandb
     os.environ["WANDB_DISABLED"] = "true"
-    
+
     print(
         f"Finetuning model with params:\n"
         f"base_model: {base_model}\n"
@@ -94,17 +94,13 @@ def train(
     gradient_accumulation_steps = batch_size // micro_batch_size
 
     device_map = "auto"
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    print(f"Using device: {device}")
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-    )
+        torch_dtype=torch.float16 if device.type == 'mps' else torch.float32,
+    ).to(device)
 
     if model.config.model_type == "LLaMA":
         # Due to the name of transformers' LLaMATokenizer, we have to do this
@@ -208,7 +204,7 @@ def train(
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
 
-    if not ddp and torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
@@ -272,7 +268,7 @@ def generate_prompt(data_point):
                 {data_point["input"]}
                 
                 ### Response:
-                {data_point["output"]}""" # noqa: E501
+                {data_point["output"]}"""  # noqa: E501
     else:
         return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.  
 
@@ -280,7 +276,7 @@ def generate_prompt(data_point):
                 {data_point["instruction"]}
                 
                 ### Response:
-                {data_point["output"]}""" # noqa: E501
+                {data_point["output"]}"""  # noqa: E501
 
 
 if __name__ == "__main__":
