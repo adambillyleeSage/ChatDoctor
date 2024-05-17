@@ -17,6 +17,10 @@ from peft import (  # noqa: E402
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizerFast  # noqa: F402
 
+import ray.train.huggingface.transformers
+from ray.train import ScalingConfig
+from ray.train.torch import TorchTrainer
+
 
 def train(
         # model/data params
@@ -97,7 +101,7 @@ def train(
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=True,
+        load_in_8bit=True if torch.backends.cuda.is_built() else False,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
@@ -219,7 +223,6 @@ def train(
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
-            fp16=True,
             logging_steps=10,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
@@ -248,6 +251,11 @@ def train(
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
+
+    # ray train adaptor
+    call_back = ray.train.huggingface.transformers.RayTrainReportCallback()
+    trainer.add_callback(call_back)
+    trainer = ray.train.huggingface.transformers.prepare_trainer(trainer)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
@@ -282,4 +290,12 @@ def generate_prompt(data_point):
 
 
 if __name__ == "__main__":
-    fire.Fire(train)
+    ray_trainer = TorchTrainer(
+        fire.Fire(train),
+        scaling_config=ScalingConfig(num_workers=2, use_gpu=True),
+        # [4a] If running in a multi-node cluster, this is where you
+        # should configure the run's persistent storage that is accessible
+        # across all worker nodes.
+        # run_config=ray.train.RunConfig(storage_path="s3://..."),
+    )
+    trainer.fit()
